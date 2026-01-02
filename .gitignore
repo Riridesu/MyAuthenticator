@@ -1,0 +1,18 @@
+# Python 暫存
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+
+# 虛擬環境
+venv/
+
+# ⚠️ 安全性忽略 (絕對不可上傳!)
+secret.key
+tokens.encrypted
+auth.log
+
+# IDE 設定
+.vscode/
+.idea/
