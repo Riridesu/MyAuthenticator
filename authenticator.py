@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-現代化 UI 安全驗證器 (v1.2.0 - Factory Reset Added)
-- 新增：一鍵重置功能 (Factory Reset)，徹底清除所有 AppData 資料與金鑰
-- 維持：自動備份、AppData 安全路徑、滾動條修正、高對比 UI
+現代化 UI 安全驗證器 (v1.2.3 - Icon Update)
+- UI 優化：將重置圖示更改為「↻」
+- 核心功能：智慧遷移 (自動讀取同目錄下的舊版資料)、AppData 安全儲存、一鍵貼上
 """
 from __future__ import annotations
 import tkinter as tk
@@ -65,7 +65,6 @@ KEY_FILE = BASE_DIR / "secret.key"
 # --------------------------
 logger = logging.getLogger("authenticator")
 logger.setLevel(logging.DEBUG)
-# 清除舊的 handlers 避免重複
 if logger.handlers:
     logger.handlers.clear()
 
@@ -95,8 +94,11 @@ COLOR_CARD_BG = "#141414"
 COLOR_CARD_BORDER = "#333333"
 COLOR_PRIMARY = "#4CC9F0"
 COLOR_PRIMARY_HOVER = "#80DFFF"
-COLOR_DANGER = "#FF4D4D"
-COLOR_DANGER_HOVER = "#FF1111"
+
+# 重置按鈕顏色 (警告紅)
+COLOR_DANGER = "#FF6B6B"       
+COLOR_DANGER_HOVER = "#FF8888" 
+
 COLOR_SUCCESS = "#00FF99"
 COLOR_TEXT_MAIN = "#FFFFFF"
 COLOR_TEXT_SUB = "#AAAAAA"
@@ -109,26 +111,49 @@ FONT_TITLE = (FONT_FAMILY, 18, "bold")
 FONT_CODE = ("Consolas", 24, "bold")
 
 # --------------------------
-# 1. 資料遷移模組
+# 1. 智慧資料遷移模組 (Smart Migration)
 # --------------------------
 def migrate_legacy_files():
-    cwd = Path.cwd()
+    """
+    智慧偵測舊資料：
+    1. 鎖定 .exe 所在的資料夾 (比 cwd 更準確)
+    2. 如果發現舊資料，自動搬移到 AppData 安全目錄
+    """
+    # 判斷程式執行位置 (打包後與未打包的路徑不同)
+    if getattr(sys, 'frozen', False):
+        # 打包後 (.exe) 的所在目錄
+        app_dir = Path(sys.executable).parent
+    else:
+        # 開發時 (.py) 的所在目錄
+        app_dir = Path(__file__).parent
+
+    logger.info(f"Checking for legacy files in: {app_dir}")
+
     legacy_files = {
         "secret.key": KEY_FILE,
         "tokens.encrypted": DATA_FILE,
         "auth.log": LOG_FILE
     }
     
+    migrated_count = 0
     for filename, target_path in legacy_files.items():
-        source_path = cwd / filename
+        source_path = app_dir / filename
+        
+        # 邏輯：如果舊位置有檔案，且新位置(AppData)沒有 -> 搬移 (升級)
         if source_path.exists() and not target_path.exists():
             try:
                 shutil.move(str(source_path), str(target_path))
-                logger.info(f"Migrated {filename} to {target_path}")
+                logger.info(f"✅ Migrated {filename} to AppData")
+                migrated_count += 1
             except Exception as e:
-                logger.error(f"Failed to migrate {filename}: {e}")
+                logger.error(f"❌ Failed to migrate {filename}: {e}")
+        
+        # 邏輯：如果舊位置有，新位置也有 -> 視為殘留，為了安全，不覆蓋新資料，但紀錄 Log
         elif source_path.exists() and target_path.exists():
-            logger.warning(f"File collision: {filename}. Keeping AppData version.")
+            logger.warning(f"ℹ️ File collision: {filename} exists in both. Using AppData version.")
+
+    if migrated_count > 0:
+        logger.info(f"Migration complete. {migrated_count} files moved.")
 
 # --------------------------
 # 2. 安全性模組
@@ -281,7 +306,7 @@ class ModernButton(tk.Label):
         self.config(bg=self.hover_color)
         if self.default_fg == COLOR_PRIMARY:
              self.config(fg=COLOR_PRIMARY_HOVER)
-        elif self.default_fg == COLOR_DANGER: # 紅色按鈕變更亮
+        elif self.default_fg == COLOR_DANGER:
              self.config(fg=COLOR_DANGER_HOVER)
         elif self.default_fg == COLOR_TEXT_SUB:
              self.config(fg="white")
@@ -470,20 +495,17 @@ class AuthenticatorApp:
 
         tk.Label(header_frame, text="Authenticator", font=FONT_TITLE, bg=COLOR_BG, fg=COLOR_TEXT_MAIN).pack(side="left")
 
-        # 動作按鈕區
         btn_frame = tk.Frame(header_frame, bg=COLOR_BG)
         btn_frame.pack(side="right")
 
-        # 新增
         ModernButton(btn_frame, text="＋ 新增", command=self.add_account, fg=COLOR_PRIMARY,
                      font=FONT_BOLD).pack(side="left", padx=S(2))
 
-        # 匯入
         ModernButton(btn_frame, text="📥 匯入", command=self.import_google_qr, fg=COLOR_SUCCESS,
                      font=FONT_BOLD).pack(side="left", padx=S(2))
         
-        # [新增] 重置按鈕 (Danger Red)
-        ModernButton(btn_frame, text="⚠️ 重置", command=self.factory_reset, fg=COLOR_DANGER,
+        # [修改] 使用圓形箭頭 ↻
+        ModernButton(btn_frame, text="↻ 重置", command=self.factory_reset, fg=COLOR_DANGER,
                      font=FONT_BOLD).pack(side="left", padx=S(2))
 
         container = tk.Frame(self.root, bg=COLOR_BG)
@@ -505,30 +527,17 @@ class AuthenticatorApp:
         self.refresh_list()
 
     def factory_reset(self):
-        """完全重置程式：刪除資料、金鑰、日誌並關閉"""
         msg = "⚠️ 警告：這將永久刪除所有帳戶資料與金鑰！\n\n此動作無法復原。\n您確定要將程式回復至初始狀態嗎？"
         if ask_confirm_dark(self.root, "危險操作確認", msg):
             try:
-                # 1. 停止更新
                 self._running = False
-                
-                # 2. 清除剪貼簿
                 self.root.clipboard_clear()
-                
-                # 3. 關閉 logging 以便刪除檔案
                 logging.shutdown()
-                
-                # 4. 刪除整個 AppData 資料夾
                 if BASE_DIR.exists():
                     shutil.rmtree(BASE_DIR, ignore_errors=True)
-                
-                # 5. 自我銷毀提示
                 show_message_dark(self.root, "重置完成", "所有資料已清除。\n程式將自動關閉。", False)
-                
-                # 6. 強制結束
                 self.root.destroy()
                 sys.exit(0)
-                
             except Exception as e:
                 show_message_dark(self.root, "重置失敗", f"無法完全刪除檔案: {e}\n請手動刪除 {BASE_DIR}", True)
 
