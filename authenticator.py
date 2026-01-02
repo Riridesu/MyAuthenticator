@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-現代化 UI 安全驗證器 (Fix: pywin32 API arguments + graceful shutdown)
-- 修正：CryptProtectData 參數數量錯誤導致的 TypeError
-- 新增：乾淨的關閉流程（處理 SIGINT/SIGTERM/SIGBREAK、WM_DELETE_WINDOW）
-- 維持：最高安全性 (DPAPI + ACLs) + 最佳化 UI
+現代化 UI 安全驗證器 (v1.2.0 - Factory Reset Added)
+- 新增：一鍵重置功能 (Factory Reset)，徹底清除所有 AppData 資料與金鑰
+- 維持：自動備份、AppData 安全路徑、滾動條修正、高對比 UI
 """
 from __future__ import annotations
 import tkinter as tk
@@ -14,6 +13,7 @@ import pyotp
 import time
 import json
 import os
+import shutil
 import pyperclip
 import base64
 import urllib.parse
@@ -31,7 +31,7 @@ import sys
 from cryptography.fernet import Fernet
 
 # --------------------------
-# 0. 系統顯示設定
+# 0. 系統顯示與路徑設定
 # --------------------------
 SCALE_FACTOR = 1.0
 
@@ -47,16 +47,31 @@ except Exception:
 def S(size: int) -> int:
     return int(size * SCALE_FACTOR)
 
+# --- 設定安全的資料儲存目錄 ---
+APP_NAME = "ModernAuthenticator"
+if os.name == 'nt':
+    BASE_DIR = Path(os.getenv('LOCALAPPDATA')) / APP_NAME
+else:
+    BASE_DIR = Path.home() / f".{APP_NAME}"
+
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE = BASE_DIR / "auth.log"
+DATA_FILE = BASE_DIR / "tokens.encrypted"
+KEY_FILE = BASE_DIR / "secret.key"
+
 # --------------------------
 # 配置與日誌
 # --------------------------
-LOG_FILE = Path("auth.log")
 logger = logging.getLogger("authenticator")
 logger.setLevel(logging.DEBUG)
-if not logger.handlers:
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-    logger.addHandler(fh)
+# 清除舊的 handlers 避免重複
+if logger.handlers:
+    logger.handlers.clear()
+
+fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+logger.addHandler(fh)
 
 try:
     from winsdk.windows.security.credentials.ui import UserConsentVerifier
@@ -72,9 +87,6 @@ except Exception:
     win32crypt = None
     _HAS_PYWIN32 = False
 
-DATA_FILE = Path("tokens.encrypted")
-KEY_FILE = Path("secret.key")
-
 # --------------------------
 # UI 風格設定
 # --------------------------
@@ -84,6 +96,7 @@ COLOR_CARD_BORDER = "#333333"
 COLOR_PRIMARY = "#4CC9F0"
 COLOR_PRIMARY_HOVER = "#80DFFF"
 COLOR_DANGER = "#FF4D4D"
+COLOR_DANGER_HOVER = "#FF1111"
 COLOR_SUCCESS = "#00FF99"
 COLOR_TEXT_MAIN = "#FFFFFF"
 COLOR_TEXT_SUB = "#AAAAAA"
@@ -96,7 +109,29 @@ FONT_TITLE = (FONT_FAMILY, 18, "bold")
 FONT_CODE = ("Consolas", 24, "bold")
 
 # --------------------------
-# 1. 安全性模組 (Fixed)
+# 1. 資料遷移模組
+# --------------------------
+def migrate_legacy_files():
+    cwd = Path.cwd()
+    legacy_files = {
+        "secret.key": KEY_FILE,
+        "tokens.encrypted": DATA_FILE,
+        "auth.log": LOG_FILE
+    }
+    
+    for filename, target_path in legacy_files.items():
+        source_path = cwd / filename
+        if source_path.exists() and not target_path.exists():
+            try:
+                shutil.move(str(source_path), str(target_path))
+                logger.info(f"Migrated {filename} to {target_path}")
+            except Exception as e:
+                logger.error(f"Failed to migrate {filename}: {e}")
+        elif source_path.exists() and target_path.exists():
+            logger.warning(f"File collision: {filename}. Keeping AppData version.")
+
+# --------------------------
+# 2. 安全性模組
 # --------------------------
 class SecurityManager:
     @staticmethod
@@ -109,21 +144,23 @@ class SecurityManager:
     @staticmethod
     def _try_crypt_unprotect(data: bytes) -> bytes:
         if not _HAS_PYWIN32 or not data:
-            raise RuntimeError("pywin32 missing - Cannot decrypt securely")
+            raise RuntimeError("pywin32 missing")
         try:
-            # CryptUnprotectData(DataIn, DataDescr, OptionalEntropy, Reserved, PromptStruct, Flags)
             dec = win32crypt.CryptUnprotectData(data, None, None, None, None, 0)
             return dec[1] if isinstance(dec, tuple) else bytes(dec)
         except Exception:
-            logger.exception("DPAPI Decryption Failed")
-            raise
+            try:
+                dec = win32crypt.CryptUnprotectData(data, None, None, None, 0)
+                return dec[1] if isinstance(dec, tuple) else bytes(dec)
+            except Exception as e:
+                logger.exception("DPAPI Decryption Failed")
+                raise e
 
     @staticmethod
     def _try_crypt_protect(data: bytes) -> bytes:
         if not _HAS_PYWIN32 or not data:
-            raise RuntimeError("pywin32 missing - Cannot encrypt securely")
+            raise RuntimeError("pywin32 missing")
         try:
-            # CryptProtectData(DataIn, DataDescr, OptionalEntropy, Reserved, PromptStruct, Flags)
             prot = win32crypt.CryptProtectData(data, None, None, None, None, 0)
             if isinstance(prot, tuple):
                 return bytes(prot[0])
@@ -141,21 +178,38 @@ class SecurityManager:
                     try:
                         key = SecurityManager._try_crypt_unprotect(raw)
                         return key
-                    except Exception:
-                        raise RuntimeError("無法解密金鑰 (是否更換了電腦或使用者？)")
+                    except Exception as e:
+                        logger.error(f"Failed to decrypt key: {e}")
+                        SecurityManager._backup_and_reset_keys()
+                        return SecurityManager.load_key()
                 return raw
             else:
-                key = Fernet.generate_key()
-                if _HAS_PYWIN32 and os.name == "nt":
-                    protected_key = SecurityManager._try_crypt_protect(key)
-                    KEY_FILE.write_bytes(protected_key)
-                else:
-                    KEY_FILE.write_bytes(key)
-                SecurityManager._restrict_file_permissions(KEY_FILE)
-                return key
+                return SecurityManager._generate_and_save_new_key()
         except Exception:
-            logger.exception("Key Loading Error")
+            logger.exception("Critical Key Loading Error")
             raise
+
+    @staticmethod
+    def _backup_and_reset_keys():
+        timestamp = int(time.time())
+        try:
+            if KEY_FILE.exists():
+                os.rename(KEY_FILE, f"{KEY_FILE}.bak.{timestamp}")
+            if DATA_FILE.exists():
+                os.rename(DATA_FILE, f"{DATA_FILE}.bak.{timestamp}")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _generate_and_save_new_key() -> bytes:
+        key = Fernet.generate_key()
+        if _HAS_PYWIN32 and os.name == "nt":
+            protected_key = SecurityManager._try_crypt_protect(key)
+            KEY_FILE.write_bytes(protected_key)
+        else:
+            KEY_FILE.write_bytes(key)
+        SecurityManager._restrict_file_permissions(KEY_FILE)
+        return key
 
     @staticmethod
     def encrypt_data(data_list: List[Dict[str, Any]]) -> bytes:
@@ -173,14 +227,13 @@ class SecurityManager:
             obj = json.loads(decrypted.decode("utf-8"))
             return obj["accounts"] if isinstance(obj, dict) else obj
         except Exception:
-            logger.exception("Data Decryption Error")
             return []
 
     @staticmethod
     def save_data_atomic(data_list: List[Dict[str, Any]]):
         try:
             encrypted = SecurityManager.encrypt_data(data_list)
-            with tempfile.NamedTemporaryFile(delete=False, dir=".") as tf:
+            with tempfile.NamedTemporaryFile(delete=False, dir=BASE_DIR) as tf:
                 tf.write(encrypted)
                 tmpname = tf.name
             SecurityManager._restrict_file_permissions(Path(tmpname))
@@ -206,7 +259,7 @@ class SecurityManager:
         except Exception as e: return False, str(e)
 
 # --------------------------
-# 2. UI 元件
+# 3. UI 元件
 # --------------------------
 class ModernButton(tk.Label):
     def __init__(self, parent, text, command, hover_color=COLOR_CARD_BORDER, fg=COLOR_PRIMARY, font=FONT_BOLD, **kwargs):
@@ -228,6 +281,8 @@ class ModernButton(tk.Label):
         self.config(bg=self.hover_color)
         if self.default_fg == COLOR_PRIMARY:
              self.config(fg=COLOR_PRIMARY_HOVER)
+        elif self.default_fg == COLOR_DANGER: # 紅色按鈕變更亮
+             self.config(fg=COLOR_DANGER_HOVER)
         elif self.default_fg == COLOR_TEXT_SUB:
              self.config(fg="white")
 
@@ -329,9 +384,6 @@ def ask_confirm_dark(parent, title, message):
     d = NativeDarkDialog(parent, title, message, mode="confirm")
     return d.result is True
 
-# --------------------------
-# 3. Google Migration Decoder
-# --------------------------
 class GoogleMigrationDecoder:
     @staticmethod
     def decode(migration_url: str) -> List[Dict[str, str]]:
@@ -384,7 +436,7 @@ class GoogleMigrationDecoder:
         return {"name": disp or "Unknown", "secret": sb32}
 
 # --------------------------
-# 4. 主應用程式
+# 5. 主應用程式
 # --------------------------
 class AuthenticatorApp:
     def __init__(self, root: tk.Tk, hidden_root: tk.Tk | None = None):
@@ -406,7 +458,7 @@ class AuthenticatorApp:
         raw = SecurityManager.decrypt_data()
         self.accounts = raw if isinstance(raw, list) else []
 
-        self._running = True  # used to control periodic callbacks
+        self._running = True
         self._closing = False
 
         self.setup_ui()
@@ -418,13 +470,20 @@ class AuthenticatorApp:
 
         tk.Label(header_frame, text="Authenticator", font=FONT_TITLE, bg=COLOR_BG, fg=COLOR_TEXT_MAIN).pack(side="left")
 
+        # 動作按鈕區
         btn_frame = tk.Frame(header_frame, bg=COLOR_BG)
         btn_frame.pack(side="right")
 
+        # 新增
         ModernButton(btn_frame, text="＋ 新增", command=self.add_account, fg=COLOR_PRIMARY,
                      font=FONT_BOLD).pack(side="left", padx=S(2))
 
+        # 匯入
         ModernButton(btn_frame, text="📥 匯入", command=self.import_google_qr, fg=COLOR_SUCCESS,
+                     font=FONT_BOLD).pack(side="left", padx=S(2))
+        
+        # [新增] 重置按鈕 (Danger Red)
+        ModernButton(btn_frame, text="⚠️ 重置", command=self.factory_reset, fg=COLOR_DANGER,
                      font=FONT_BOLD).pack(side="left", padx=S(2))
 
         container = tk.Frame(self.root, bg=COLOR_BG)
@@ -435,6 +494,7 @@ class AuthenticatorApp:
 
         self.window_id = self.canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.window_id, width=e.width))
+        self.scroll_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
 
         self.canvas.pack(side="left", fill="both", expand=True)
 
@@ -444,7 +504,50 @@ class AuthenticatorApp:
 
         self.refresh_list()
 
+    def factory_reset(self):
+        """完全重置程式：刪除資料、金鑰、日誌並關閉"""
+        msg = "⚠️ 警告：這將永久刪除所有帳戶資料與金鑰！\n\n此動作無法復原。\n您確定要將程式回復至初始狀態嗎？"
+        if ask_confirm_dark(self.root, "危險操作確認", msg):
+            try:
+                # 1. 停止更新
+                self._running = False
+                
+                # 2. 清除剪貼簿
+                self.root.clipboard_clear()
+                
+                # 3. 關閉 logging 以便刪除檔案
+                logging.shutdown()
+                
+                # 4. 刪除整個 AppData 資料夾
+                if BASE_DIR.exists():
+                    shutil.rmtree(BASE_DIR, ignore_errors=True)
+                
+                # 5. 自我銷毀提示
+                show_message_dark(self.root, "重置完成", "所有資料已清除。\n程式將自動關閉。", False)
+                
+                # 6. 強制結束
+                self.root.destroy()
+                sys.exit(0)
+                
+            except Exception as e:
+                show_message_dark(self.root, "重置失敗", f"無法完全刪除檔案: {e}\n請手動刪除 {BASE_DIR}", True)
+
     def _on_mousewheel(self, event):
+        delta = 0
+        if os.name == "nt":
+            delta = event.delta
+        elif event.num == 4:
+            delta = 120
+        elif event.num == 5:
+            delta = -120
+
+        if delta == 0: return
+        if self.scroll_frame.winfo_height() <= self.canvas.winfo_height(): return
+
+        top, bottom = self.canvas.yview()
+        if delta > 0 and top <= 0: return
+        if delta < 0 and bottom >= 1.0: return
+
         try:
             if os.name == "nt":
                 self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
@@ -504,7 +607,7 @@ class AuthenticatorApp:
         self.code_widgets.append({"secret": acc["secret"], "label": code_lbl, "progress": progress, "copied": False})
 
     def update_codes(self):
-        if not self._running:  # stop scheduling if shutting down
+        if not self._running:
             return
         try:
             now = time.time()
@@ -519,7 +622,6 @@ class AuthenticatorApp:
         except Exception:
             logger.exception("update_codes error")
         finally:
-            # schedule next run only if still running
             if self._running:
                 self.root.after(100, self.update_codes)
 
@@ -589,30 +691,23 @@ class AuthenticatorApp:
             logger.exception("Failed to save data on request")
 
     def request_close(self):
-        """
-        Graceful shutdown: ensure we only run shutdown once,
-        stop periodic callbacks, save data, and destroy windows.
-        """
         if self._closing:
             return
         self._closing = True
         logger.info("Requesting application shutdown")
         try:
             self._running = False
-            # persist any pending changes
             try:
                 self.save()
             except Exception:
                 logger.exception("Error while saving during shutdown")
-            # destroy hidden root if any
             if self.hidden_root:
                 try:
                     self.hidden_root.destroy()
                 except Exception:
                     pass
-            # Quit and destroy main root safely
             try:
-                self.root.quit()    # exits mainloop
+                self.root.quit()
             except Exception:
                 pass
             try:
@@ -623,9 +718,14 @@ class AuthenticatorApp:
             logger.exception("Error during shutdown")
 
 # --------------------------
-# 5. 啟動入口 (改為先驗證再進入 tkinter mainloop)
+# 6. 啟動入口
 # --------------------------
 if __name__ == "__main__":
+    try:
+        migrate_legacy_files()
+    except Exception as e:
+        logger.error(f"Migration failed: {e}")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-windows-hello", action="store_true")
     args = parser.parse_args()
@@ -648,17 +748,15 @@ if __name__ == "__main__":
     except Exception as e:
         tmp = tk.Tk()
         tmp.withdraw()
-        messagebox.showerror("錯誤", f"金鑰錯誤: {e}", parent=tmp)
+        messagebox.showerror("嚴重錯誤", f"金鑰重置失敗，請檢查權限: {e}", parent=tmp)
         tmp.destroy()
         sys.exit(1)
 
-    # 建立 GUI，註冊關閉與訊號處理
     root = tk.Tk()
     app = AuthenticatorApp(root, None)
     root.protocol("WM_DELETE_WINDOW", app.request_close)
 
     def _signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, scheduling shutdown")
         try:
             root.after(0, app.request_close)
         except Exception:
@@ -667,23 +765,20 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
-    # register common signals
     for s in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(s, _signal_handler)
         except Exception:
-            logger.exception(f"Failed to set signal handler for {s}")
-    # SIGBREAK exists on Windows for Ctrl+Break
+            pass
     if hasattr(signal, "SIGBREAK"):
         try:
             signal.signal(signal.SIGBREAK, _signal_handler)
         except Exception:
-            logger.exception("Failed to set SIGBREAK handler")
+            pass
 
     try:
         root.mainloop()
     finally:
-        logger.info("Mainloop finished — final cleanup")
         try:
             app.request_close()
         except Exception:
