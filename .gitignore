@@ -1,18 +1,27 @@
-# Python 暫存
+# Python 編譯與暫存檔
 __pycache__/
 *.py[cod]
+
+# 打包產生的檔案
 build/
 dist/
 *.spec
 
 # 虛擬環境
 venv/
+.env
 
 # ⚠️ 安全性忽略 (絕對不可上傳!)
 secret.key
 tokens.encrypted
 auth.log
+*.bak.*
 
-# IDE 設定
+# IDE 設定檔
 .vscode/
 .idea/
+
+# 個人便利腳本 (新增這行)
+run.bat
+build.bat
+publish.bat

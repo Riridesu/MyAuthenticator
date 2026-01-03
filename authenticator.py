@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-現代化 UI 安全驗證器 (v1.2.3 - Icon Update)
-- UI 優化：將重置圖示更改為「↻」
+現代化 UI 安全驗證器 (v1.2.3 - Icon Update & Smart Migration)
+- UI 優化：將重置按鈕圖示更改為「↻」，符合循環/回復的視覺意象
 - 核心功能：智慧遷移 (自動讀取同目錄下的舊版資料)、AppData 安全儲存、一鍵貼上
 """
 from __future__ import annotations
@@ -603,9 +603,19 @@ class AuthenticatorApp:
         if acc.get("issuer"):
             tk.Label(inner, text=acc["issuer"], font=(FONT_FAMILY, 10), fg=COLOR_TEXT_SUB, bg=COLOR_CARD_BG).pack(anchor="w", pady=(0, S(2)))
 
-        code_lbl = tk.Label(inner, text="--- ---", font=FONT_CODE, fg=COLOR_PRIMARY, bg=COLOR_CARD_BG, cursor="hand2")
-        code_lbl.pack(fill="x", pady=S(6))
-        code_lbl.bind("<Button-1>", lambda e, l=code_lbl, s=acc["secret"]: self.copy_code(l, s))
+        # [修改] 將 code_row 分成兩部分：左邊是數字，右邊是提示標籤
+        code_row = tk.Frame(inner, bg=COLOR_CARD_BG)
+        code_row.pack(fill="x", pady=S(6))
+
+        code_lbl = tk.Label(code_row, text="--- ---", font=FONT_CODE, fg=COLOR_PRIMARY, bg=COLOR_CARD_BG, cursor="hand2")
+        code_lbl.pack(side="left")
+        
+        # 隱藏的提示標籤 (Copied!)
+        msg_lbl = tk.Label(code_row, text="", font=(FONT_FAMILY, 10, "bold"), fg=COLOR_SUCCESS, bg=COLOR_CARD_BG)
+        msg_lbl.pack(side="left", padx=S(10))
+
+        # 點擊數字時觸發複製
+        code_lbl.bind("<Button-1>", lambda e, l=code_lbl, m=msg_lbl, s=acc["secret"]: self.copy_code(l, m, s))
         code_lbl.bind("<Enter>", lambda e: code_lbl.config(fg="white"))
         code_lbl.bind("<Leave>", lambda e: code_lbl.config(fg=COLOR_PRIMARY))
 
@@ -623,33 +633,42 @@ class AuthenticatorApp:
             rem = 30 - (now % 30)
             for item in self.code_widgets:
                 item["progress"]["value"] = rem
-                if not item["copied"]:
-                    totp = pyotp.TOTP(item["secret"])
-                    c = totp.now()
-                    color = COLOR_DANGER if rem <= 5 else COLOR_PRIMARY
+                # 永遠更新數字，不被 "copied" 狀態鎖死
+                totp = pyotp.TOTP(item["secret"])
+                c = totp.now()
+                color = COLOR_DANGER if rem <= 5 else COLOR_PRIMARY
+                
+                # 如果滑鼠沒在上面 (沒變白)，就更新顏色
+                if str(item["label"].cget("fg")) != "white":
                     item["label"].config(text=f"{c[:3]} {c[3:]}", fg=color)
+                else:
+                    item["label"].config(text=f"{c[:3]} {c[3:]}")
+
         except Exception:
             logger.exception("update_codes error")
         finally:
             if self._running:
                 self.root.after(100, self.update_codes)
 
-    def copy_code(self, label, secret):
+    def copy_code(self, label, msg_label, secret):
+        """
+        [修改] 複製時，不改變數字文字，而是在旁邊顯示提示
+        """
         try:
             code = pyotp.TOTP(secret).now()
             pyperclip.copy(code)
 
-            orig_text = label.cget("text")
-            label.config(text="COPIED", fg=COLOR_SUCCESS, font=(FONT_FAMILY, 20, "bold"))
-            for w in self.code_widgets:
-                if w["label"] == label: w["copied"] = True
+            # 顯示提示
+            msg_label.config(text="✓ Copied!")
+            
+            # 1 秒後清除提示
+            def clear_msg():
+                try:
+                    msg_label.config(text="")
+                except: pass
 
-            def restore():
-                label.config(text=orig_text, font=FONT_CODE)
-                for w in self.code_widgets:
-                    if w["label"] == label: w["copied"] = False
+            self.root.after(1000, clear_msg)
 
-            self.root.after(800, restore)
         except Exception as e:
             show_message_dark(self.root, "錯誤", str(e), True)
 
