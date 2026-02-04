@@ -1,0 +1,5 @@
+{
+    "entry_point": "src/authenticator.py",
+    "output_name": "Authenticator",
+    "git_repo": "MyAuthenticator"
+}
